@@ -9,6 +9,8 @@ from dotenv import dotenv_values
 import threading
 import boto3
 from typing import Dict, List
+from collections import deque
+
 
 
 
@@ -23,16 +25,59 @@ class PDFViewer:
         self.current_page_index = 1  
         self.pdf_reader = PdfReader(file_path)
         self.num_pages = len(self.pdf_reader.pages)
+        self.audio_cache = deque(maxlen=2)
 
         self.current_audio_index = 0
         self.current_summary_index = 0
         self.current_interp_index = 0
-        
-        self.read_pdf()
+
+        self.audio_loaded = False
+
+        # Initialize variables to empty lists instead of None to prevent TypeError.
+        self.speech = []
+        self.summary = []
+        self.interp = []
+        threading.Thread(target=self.read_pdf).start()
         pygame.init()
         pygame.mixer.init()
 
+        self.content_lock = threading.Lock()
+        self.load_page_content(self.current_page_index)
+        self.pre_fetch_next_page()
+
     
+    def load_page_content(self, page_index):
+
+        with self.content_lock:
+                page = self.pdf_reader.pages[page_index]
+                text = page.extract_text() if page else ""
+                processed_data = self.process_page(text) if text else ([], [], [])
+                if processed_data is not None:
+                    self.update_content_variables(processed_data)
+                # self.audio_cache.append({
+                #     'speech': processed_data[0],
+                #     'summary': processed_data[1],
+                #     'interp': processed_data[2],
+                #     'page_index': page_index
+                # })
+                self.audio_loaded = True
+
+    def update_content_variables(self, data):
+        # Assuming 'data' is a tuple of (speech, summary, interp).
+        self.speech, self.summary, self.interp = data
+    # def pre_fetch_next_page(self):
+    #     # Pre-fetching the next page in a separate thread
+    #     next_page_index = self.current_page_index + 1
+    #     if next_page_index < self.num_pages:
+    #         threading.Thread(target=self.load_page_content, args=(next_page_index,)).start()
+
+    def pre_fetch_next_page(self):
+        # Pre-fetch the next page content
+        next_page_index = self.current_page_index + 1
+        if next_page_index < self.num_pages:
+            prefetch_thread = threading.Thread(target=self.load_page_content, args=(next_page_index,))
+            prefetch_thread.start()
+            prefetch_thread.join()
 
     def process_page(self,text):
         summary_text_resp = openai.ChatCompletion.create(
@@ -61,17 +106,59 @@ class PDFViewer:
             pdf_reader = PdfReader(file)
             page = self.pdf_reader.pages[self.current_page_index]
             text = page.extract_text() if page else ""
-            self.speech, self.summary, self.interp = self.process_page(text)
+            self.curr_text = text
+            processed_data = self.process_page(text)
+            if processed_data:
+                print("test")
+                self.speech, self.summary, self.interp = processed_data
+                self.audio_loaded = True
+            else:
+                # Handle the case when process_page returns None (e.g., when there is no content).
+                self.speech = []
+                self.summary = []
+                self.interp = []
 
 
     def next_page_handler(self):
 
-        if self.current_page_index < self.num_pages:
-            self.current_page_index += 1
-            threading.Thread(target=self.read_pdf).start()
-        else:
-            print("No more pages to read.")
+        pygame.mixer.music.stop()  # Stop any currently playing audio
 
+        self.current_audio_index = 0  # Reset the playback index for audio
+        self.current_summary_index = 0  # Reset the playback index for summary
+        self.current_interp_index = 0  # Reset the playback index for interpretation
+
+        # Move to the next page if possible
+        with self.content_lock:
+            if self.current_page_index < self.num_pages - 1:
+                self.current_page_index += 1
+
+                # Reset the indices for the new content.
+                self.current_audio_index = 0
+                self.current_summary_index = 0
+                self.current_interp_index = 0
+
+                # Load content for the new page.
+                self.load_page_content(self.current_page_index)
+            else:
+                print("No more pages to read.")
+
+    def update_content(self):
+        if self.audio_loaded:
+            if self.current_page_index < self.num_pages:
+                page = self.pdf_reader.pages[self.current_page_index]
+                text = page.extract_text() if page else ""
+                
+                if text:
+                    processed_data = self.process_page(text)
+                    if processed_data:
+                        self.speech, self.summary, self.interp = processed_data
+                        self.audio_loaded = True  # Indicate that audio is now loaded
+                    else:
+                        # If processing fails, indicate that by setting audio_loaded to False
+                        self.audio_loaded = False
+                else:
+                    # No text found in the current page
+                    self.audio_loaded = False
 
     def synthesize_speech(self,text):
         polly = boto3.client('polly', region_name='us-east-1',
@@ -159,15 +246,20 @@ class PDFViewer:
         self.root.mainloop()
 
     def play_speech(self):
-
-        if self.current_summary_index < len(self.speech):
-            pygame.mixer.music.load(BytesIO(self.speech[self.current_summary_index]))
-            pygame.mixer.music.play(loops=0)
-            self.current_summary_index += 1
-        else:
-            self.current_summary_index = 0
+        print("Page: ",self.current_page_index,"\n", self.curr_text)
+        with self.content_lock:
+            if self.audio_loaded and self.current_audio_index < len(self.speech):
+                pygame.mixer.music.load(BytesIO(self.speech[self.current_audio_index]))
+                pygame.mixer.music.play(loops=0)
+                self.current_audio_index += 1
+            else:
+                print("Audio not loaded")
+                self.current_audio_index = 0
 
     def stop_audio(self):
+        self.current_audio_index = 0
+        self.current_summary_index = 0
+        self.current_interp_index = 0
         pygame.mixer.music.stop()
 
     def pause_audio(self):
@@ -177,10 +269,22 @@ class PDFViewer:
         pygame.mixer.music.unpause()
 
     def play_summary(self):
-        pass
+        if self.audio_loaded and self.current_summary_index < len(self.summary):
+            pygame.mixer.music.load(BytesIO(self.summary[self.current_summary_index]))
+            pygame.mixer.music.play(loops=0)
+            self.current_summary_index += 1
+        else:
+            print("Audio not loaded")
+            self.current_summary_index = 0
 
     def play_interp(self):
-        pass
+        if self.audio_loaded and self.current_interp_index < len(self.interp):
+            pygame.mixer.music.load(BytesIO(self.speech[self.current_interp_index]))
+            pygame.mixer.music.play(loops=0)
+            self.current_interp_index += 1
+        else:
+            print("Audio not loaded")
+            self.current_interp_index = 0
 
 
 if __name__ == "__main__":
